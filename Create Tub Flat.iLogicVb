@@ -1,0 +1,460 @@
+﻿Imports Inventor
+Imports System.Runtime.InteropServices
+Imports System.IO
+Imports System.Linq
+Imports System.Collections.Generic
+Imports System.Windows.Forms ' Added to support Yes/No dialog results
+
+' Purpose: Automates the synchronization of a "Tub" part with a standardized Flat Pattern template.
+' This ensures cutlist dimensions remain consistent regardless of how the 3D model was constructed.
+
+Sub Main()
+    Dim app As Inventor.Application = Nothing
+    Try
+        ' Connect to the running instance of Inventor
+        app = CType(Marshal.GetActiveObject("Inventor.Application"), Inventor.Application)
+    Catch ex As Exception
+        MessageBox.Show("Could not connect to an active Inventor session. Open Inventor first.")
+        Return
+    End Try
+
+    Try
+        ' Disable UI updates to improve performance and prevent flickering
+        app.SilentOperation = True
+        'app.ScreenUpdating = False
+
+        ' ---------------------------------------------
+        ' 0) Get active document and validate naming
+        ' ---------------------------------------------
+        Dim doc = TryCast(app.ActiveDocument, PartDocument)
+        If doc Is Nothing Then
+            MessageBox.Show("Active document is not a PartDocument.")
+            Exit Sub
+        End If
+
+        ' FIX: Read directly from the open Part document instead of the rule-caller (Assembly)
+        Dim nameNoExt As String = System.IO.Path.GetFileNameWithoutExtension(doc.FullFileName)
+        Dim nameUpper As String = nameNoExt.ToUpper()
+        
+        ' FIX: Relax string spaces to mirror the assembly logic ("TUB" anywhere in the name)
+        If Not nameUpper.Contains("TUB") OrElse nameUpper.Contains("FLAT") Then
+            MessageBox.Show("This script only runs on Tub models. Active: " & nameNoExt)
+            Exit Sub
+        End If
+        
+        Dim authorName As String = iProperties.Value("Summary", "Author")
+
+        ' Extract the Part Number/IBM string from the filename (e.g., "IBM-123")
+        Dim firstToken = nameNoExt.Split(" "c).FirstOrDefault()
+        If String.IsNullOrEmpty(firstToken) OrElse Not firstToken.Contains("-") Then
+            MessageBox.Show("Could not parse IBM-addendum. Expected 'IBM-ADD TUB ...'")
+            Exit Sub
+        End If
+        Dim ibmAddendum = firstToken
+
+        ' ---------------------------------------------
+        ' 1 & 2) Validate Sheet Metal & Get RangeBox sizes
+        ' ---------------------------------------------
+        Dim compDef = TryCast(doc.ComponentDefinition, SheetMetalComponentDefinition)
+        If compDef Is Nothing Then
+            MessageBox.Show("Part is not a Sheet Metal part.")
+            Exit Sub
+        End If
+
+        ' Get the 3D bounding box (RangeBox) to determine overall dimensions
+        Dim rb = doc.ComponentDefinition.SurfaceBodies(1).RangeBox
+        Dim lengthX As Double = Math.Abs(rb.MaxPoint.X - rb.MinPoint.X)
+        Dim widthY As Double = Math.Abs(rb.MaxPoint.Y - rb.MinPoint.Y)
+        Dim depthZ As Double = Math.Abs(rb.MaxPoint.Z - rb.MinPoint.Z)
+
+        ' Convert internal Inventor units (cm) to inches
+        Const CM_PER_IN As Double = 2.54
+        Dim L_in As Double = lengthX / CM_PER_IN
+        Dim W_in As Double = widthY / CM_PER_IN
+        Dim D_in As Double = depthZ / CM_PER_IN
+
+        ' ---------------------------------------------
+        ' 3) Generate flat pattern and orient
+        ' ---------------------------------------------
+        EnsureFlatPattern(compDef)
+        TryOrientFlatPattern(compDef, L_in, W_in)
+
+        ' ---------------------------------------------
+        ' 4) Open template flat and SaveAs
+        ' ---------------------------------------------
+        ' FIX: Derive directory directly from the part's file location instead of ThisDoc.Path
+        Dim originalFolder = System.IO.Path.GetDirectoryName(doc.FullFileName)
+        Dim templatePath = "C:\_VaultWIP\Engineering\Common Parts\Sink\TUB 20X20X12D FLAT.ipt"
+        If Dir(templatePath) = "" Then
+            MessageBox.Show("Flat template not found: " & templatePath)
+            Exit Sub
+        End If
+
+        ' Create the new FLAT file name based on the TUB name
+        Dim flatName = nameNoExt & " FLAT.ipt"
+        Dim flatFullPath = originalFolder & "\" & flatName
+
+        ' NEW CHECK: Verify if the Flat file already exists
+        If System.IO.File.Exists(flatFullPath) Then
+            Dim result As DialogResult = MessageBox.Show( _
+                "A Flat Pattern file with the name '" & flatName & "' already exists in this folder." & vbCrLf & vbCrLf & _
+                "Do you want to overwrite it?", "File Already Exists", MessageBoxButtons.YesNo, MessageBoxIcon.Warning)
+            
+            If result = DialogResult.No Then
+                MessageBox.Show("Script execution cancelled by user.")
+                Exit Sub
+            End If
+        End If
+
+        ' Open the master template, save a copy to the local folder, and close the master
+        Dim flatDocTemplate = CType(app.Documents.Open(templatePath, True), PartDocument)
+        flatDocTemplate.SaveAs(flatFullPath, True)
+        flatDocTemplate.Close(True)
+
+        ' Open the newly created flat file for editing
+        Dim flatDoc = CType(app.Documents.Open(flatFullPath, True), PartDocument)
+        Dim flatDef = CType(flatDoc.ComponentDefinition, SheetMetalComponentDefinition)
+
+        ' ---------------------------------------------
+        ' 5–6) Update iProperties on Flat File
+        ' ---------------------------------------------
+        Try
+            ' Push metadata from the original 3D model to the new flat pattern file
+            Dim summaryProps = flatDoc.PropertySets.Item("Inventor Summary Information")
+            Dim designProps = flatDoc.PropertySets.Item("Design Tracking Properties")
+
+            summaryProps.Item("Author").Value = authorName
+            designProps.Item("Part Number").Value = ibmAddendum
+            designProps.Item("Designer").Value = authorName
+            designProps.Item("Description").Value = nameNoExt
+            designProps.Item("Creation Time").Value = Now
+        Catch ex As Exception
+            MessageBox.Show("iProperties Update Failed: " & ex.Message)
+        End Try
+
+        ' ---------------------------------------------
+        ' 7) Update Parameters safely
+        ' ---------------------------------------------
+        ' Push the calculated dimensions (L, W, D) into the Flat Pattern parameters
+        SetParameterInches(flatDef, "LENGTH", L_in)
+        SetParameterInches(flatDef, "WIDTH", W_in)
+        SetParameterInches(flatDef, "DEPTH", D_in)
+
+        flatDoc.Update2()
+
+        ' ---------------------------------------------
+        ' 8) Extract flat geometry from flat template
+        ' ---------------------------------------------
+        EnsureFlatPattern(flatDef)
+        Dim fpTemplate = flatDef.FlatPattern
+        
+        Dim baseFaceTemplate = GetLargestPlanarFace(fpTemplate)
+        If baseFaceTemplate Is Nothing Then
+            MessageBox.Show("Could not find a planar face in template flat pattern.")
+            Exit Sub
+        End If
+            
+        ' Create a sketch on the template's flat pattern and project its geometry
+        Dim skFlat As PlanarSketch = fpTemplate.Sketches.Add(baseFaceTemplate, True)
+        skFlat.Edit()
+        Try
+            skFlat.AddByProjectingEntity(baseFaceTemplate)
+        Catch ex As Exception
+            ' Fallback: Project edges individually if the face projection fails
+            For Each edgeEnt As Edge In baseFaceTemplate.Edges
+                skFlat.AddByProjectingEntity(edgeEnt)
+            Next
+        End Try
+        skFlat.ExitEdit()
+
+        ' ---------------------------------------------
+        ' 9) Paste into ORIGINAL tub flat pattern
+        ' ---------------------------------------------
+        ' Clear out old sketches/extrudes on the active document's flat pattern to prevent overlap
+        Dim origFP = compDef.FlatPattern
+        DeleteFlatPatternSketchesAndExtrudes(compDef)
+
+        Dim origBase = GetLargestPlanarFace(origFP)
+        Dim skDest As PlanarSketch = origFP.Sketches.Add(origBase, False)
+        
+        ' Copy geometry from the template sketch to the current part's flat pattern sketch
+        skFlat.CopyContentsTo(skDest)
+
+        ' Collect the pasted template entities so we can exclusively target them for movement
+        Dim pastedEntities As ObjectCollection = app.TransientObjects.CreateObjectCollection
+        For Each ent As SketchEntity In skDest.SketchEntities
+            pastedEntities.Add(ent)
+        Next
+
+        ' Project ONLY internal cutouts from the original model and group them for center targeting
+        Dim projectedHoles As ObjectCollection = app.TransientObjects.CreateObjectCollection
+        skDest.Edit()
+        For Each eLoop As EdgeLoop In origBase.EdgeLoops
+            If Not eLoop.IsOuterEdgeLoop Then
+                For Each ed As Edge In eLoop.Edges
+                    Try
+                        Dim projEnt = skDest.AddByProjectingEntity(ed)
+                        projectedHoles.Add(projEnt)
+                    Catch
+                    End Try
+                Next
+            End If
+        Next
+        skDest.ExitEdit()
+        
+        ' Convert all geometry (pasted and projected) from Reference to Normal
+        ' This allows AddForSolid to "see" the outer boundary and the holes.
+        For Each ent As SketchEntity In skDest.SketchEntities
+            Try
+                If ent.Reference Then
+                    ent.Reference = False
+                End If
+            Catch
+            End Try
+        Next
+        
+        AlignTemplateToPart(app, skDest, pastedEntities, projectedHoles, origFP)
+
+        ' ---------------------------------------------
+        ' 10) Center and Extrude
+        ' ---------------------------------------------
+        Dim prof As Profile = Nothing
+        skDest.Edit()
+        ' Generate a profile (recognizes the outer loop and inner holes automatically)
+        prof = skDest.Profiles.AddForSolid()
+        skDest.ExitEdit()
+
+        ' Determine extrusion depth based on material thickness (Gauge logic)
+        Dim gaugeThicknessIn As Double = GetSheetThicknessInches(compDef)
+        Dim extrudeDistanceIn As Double = If(gaugeThicknessIn <= 0.065, 0.0625, 0.078)
+        Dim distanceCm As Double = extrudeDistanceIn * CM_PER_IN
+
+        ' Perform the Join extrusion in the Flat Pattern environment
+        Dim extrudes = origFP.Features.ExtrudeFeatures
+        Dim edDef As ExtrudeDefinition = extrudes.CreateExtrudeDefinition(prof, PartFeatureOperationEnum.kJoinOperation)
+        edDef.SetDistanceExtent(distanceCm, PartFeatureExtentDirectionEnum.kPositiveExtentDirection)
+        extrudes.Add(edDef)
+
+        ' ---------------------------------------------
+        ' 11) Save and done
+        ' ---------------------------------------------
+        flatDoc.Save2()
+        doc.Save2()
+
+        MessageBox.Show("Script complete ✅")
+    Catch ex As Exception
+        MessageBox.Show("Error: " & ex.Message & vbCrLf & ex.StackTrace)
+    Finally
+        ' Always turn SilentOperation off, even if the script crashed
+        If app IsNot Nothing Then 
+            app.SilentOperation = False
+            'app.ScreenUpdating = True
+        End If
+    End Try
+End Sub
+
+'======================
+' Helpers
+'======================
+
+Private Sub EnsureFlatPattern(def As SheetMetalComponentDefinition)
+    If def.HasFlatPattern = False Then
+        def.Unfold()
+    End If
+End Sub
+
+Private Sub TryOrientFlatPattern(def As SheetMetalComponentDefinition, lIn As Double, wIn As Double)
+    If Math.Abs(lIn - wIn) < 1.0E-6 Then Exit Sub ' Skip if square
+    Dim wantXLongest As Boolean = (lIn > wIn)
+    Dim fp = def.FlatPattern
+    Dim sketch As PlanarSketch = Nothing
+
+    Try
+        Dim face = GetLargestPlanarFace(fp)
+        If face IsNot Nothing Then
+            sketch = fp.Sketches.Add(face, False)
+            sketch.Edit()
+            sketch.AddByProjectingEntity(face)
+
+            Dim minX As Double = Double.PositiveInfinity
+            Dim minY As Double = Double.PositiveInfinity
+            Dim maxX As Double = Double.NegativeInfinity
+            Dim maxY As Double = Double.NegativeInfinity
+
+            For Each ent As SketchEntity In sketch.SketchEntities
+                Dim bBox = ent.RangeBox
+                minX = Math.Min(minX, bBox.MinPoint.X)
+                minY = Math.Min(minY, bBox.MinPoint.Y)
+                maxX = Math.Max(maxX, bBox.MaxPoint.X)
+                maxY = Math.Max(maxY, bBox.MaxPoint.Y)
+            Next
+
+            Dim dx = maxX - minX
+            Dim dy = maxY - minY
+            Dim currentlyXLongest As Boolean = (dx >= dy)
+            Dim needRotate90 As Boolean = (currentlyXLongest <> wantXLongest)
+            sketch.ExitEdit()
+
+            If needRotate90 Then
+                sketch.Edit()
+                Dim ents As ObjectCollection = def.Document.Application.TransientObjects.CreateObjectCollection
+                For Each ent As SketchEntity In sketch.SketchEntities
+                    ents.Add(ent)
+                Next
+                Dim tg As TransientGeometry = def.Document.Application.TransientGeometry
+                sketch.RotateSketchObjects(ents, tg.CreatePoint2d(0, 0), Math.PI / 2.0)
+                sketch.ExitEdit()
+            End If
+        End If
+    Catch ex As Exception
+    Finally
+        ' Always clean up the temp sketch even if the rotation logic fails
+        If sketch IsNot Nothing Then
+            Try : sketch.Delete() : Catch : End Try
+        End If
+    End Try
+End Sub
+
+Private Function GetLargestPlanarFace(flat As FlatPattern) As Face
+    Dim largest As Face = Nothing
+    Dim largestArea As Double = -1.0
+    For Each f As Face In flat.SurfaceBodies(1).Faces
+        If f.SurfaceType = SurfaceTypeEnum.kPlaneSurface Then
+            Dim a = f.Evaluator.Area
+            If a > largestArea Then
+                largestArea = a
+                largest = f
+            End If
+        End If
+    Next
+    Return largest
+End Function
+
+Private Sub SetParameterInches(def As SheetMetalComponentDefinition, paramName As String, valueInches As Double)
+    Dim params = def.Parameters
+    Dim expr As String = Math.Round(valueInches, 2).ToString("0.00") & " in"
+    Dim paramExists As Boolean = False
+
+    For Each p As Parameter In params
+        If String.Equals(p.Name, paramName, StringComparison.OrdinalIgnoreCase) Then
+            Try
+                p.Expression = expr
+            Catch
+            End Try
+            paramExists = True
+            Exit For
+        End If
+    Next
+
+    If Not paramExists Then
+        Try
+            params.UserParameters.AddByExpression(paramName, expr, UnitsTypeEnum.kInchLengthUnits)
+        Catch
+        End Try
+    End If
+End Sub
+
+Private Sub DeleteFlatPatternSketchesAndExtrudes(def As SheetMetalComponentDefinition)
+    ' 1. Delete Extrudes FIRST. This un-consumed their sketches.
+    Dim toDeleteExtrudes As New List(Of ExtrudeFeature)
+    For Each ex As ExtrudeFeature In def.FlatPattern.Features.ExtrudeFeatures
+        toDeleteExtrudes.Add(ex)
+    Next
+    For Each ex In toDeleteExtrudes
+        Try : ex.Delete() : Catch : End Try
+    Next
+
+    ' 2. Now that the sketches are un-consumed and free, delete them.
+    Dim toDeleteSketches As New List(Of PlanarSketch)
+    For Each sk As PlanarSketch In def.FlatPattern.Sketches
+        toDeleteSketches.Add(sk)
+    Next
+    For Each sk In toDeleteSketches
+        Try : sk.Delete() : Catch : End Try
+    Next
+End Sub
+
+Private Sub AlignTemplateToPart(app As Inventor.Application, sk As PlanarSketch, pastedEntities As ObjectCollection, projectedHoles As ObjectCollection, origFP As FlatPattern)
+    Dim tg = app.TransientGeometry
+    sk.Edit()
+
+    ' 1. Target: Get the exact center of the internal cutouts (holes) to use as the alignment target
+    Dim targetCx As Double
+    Dim targetCy As Double
+    
+    If projectedHoles.Count > 0 Then
+        Dim tgtMinX = Double.PositiveInfinity
+        Dim tgtMinY = Double.PositiveInfinity
+        Dim tgtMaxX = Double.NegativeInfinity
+        Dim tgtMaxY = Double.NegativeInfinity
+        
+        For Each ent As SketchEntity In projectedHoles
+            Try
+                Dim box = ent.RangeBox
+                If box IsNot Nothing Then
+                    tgtMinX = Math.Min(tgtMinX, box.MinPoint.X)
+                    tgtMinY = Math.Min(tgtMinY, box.MinPoint.Y)
+                    tgtMaxX = Math.Max(tgtMaxX, box.MaxPoint.X)
+                    tgtMaxY = Math.Max(tgtMaxY, box.MaxPoint.Y)
+                End If
+            Catch
+            End Try
+        Next
+        targetCx = (tgtMinX + tgtMaxX) / 2.0
+        targetCy = (tgtMinY + tgtMaxY) / 2.0
+    Else
+        Dim bodyBox = origFP.Body.RangeBox
+        Dim modelTargetCenter As Point = tg.CreatePoint((bodyBox.MinPoint.X + bodyBox.MaxPoint.X) / 2.0, _
+                                                       (bodyBox.MinPoint.Y + bodyBox.MaxPoint.Y) / 2.0, _
+                                                       (bodyBox.MinPoint.Z + bodyBox.MaxPoint.Z) / 2.0)
+        Dim sketchTargetCenter As Point2d = sk.ModelToSketchSpace(modelTargetCenter)
+        targetCx = sketchTargetCenter.X
+        targetCy = sketchTargetCenter.Y
+    End If
+
+    ' 2. Source: Calculate the center of ONLY the pasted template entities in SKETCH space
+    Dim minX As Double = Double.PositiveInfinity
+    Dim minY As Double = Double.PositiveInfinity
+    Dim maxX As Double = Double.NegativeInfinity
+    Dim maxY As Double = Double.NegativeInfinity
+
+    For Each ent As SketchEntity In pastedEntities
+        Try
+            Dim localBox = ent.RangeBox
+            If localBox IsNot Nothing Then
+                minX = Math.Min(minX, localBox.MinPoint.X)
+                minY = Math.Min(minY, localBox.MinPoint.Y)
+                maxX = Math.Max(maxX, localBox.MaxPoint.X)
+                maxY = Math.Max(maxY, localBox.MaxPoint.Y)
+            End If
+        Catch
+        End Try
+    Next
+
+    ' 3. Move: Calculate Delta in Sketch Space and apply ONLY to the pasted entities
+    If pastedEntities.Count > 0 Then
+        Dim currentSketchCx As Double = (minX + maxX) / 2.0
+        Dim currentSketchCy As Double = (minY + maxY) / 2.0
+
+        Dim diffX As Double = targetCx - currentSketchCx
+        Dim diffY As Double = targetCy - currentSketchCy
+        
+        Dim moveVec As Vector2d = tg.CreateVector2d(diffX, diffY)
+        
+        ' Defer updates keeps the solver from ripping coincident lines apart during the move
+        sk.DeferUpdates = True
+        Try
+            sk.MoveSketchObjects(pastedEntities, moveVec)
+        Catch ex As Exception
+        End Try
+        sk.DeferUpdates = False
+    End If
+
+    sk.ExitEdit()
+End Sub
+
+Private Function GetSheetThicknessInches(def As SheetMetalComponentDefinition) As Double
+    Dim thicknessParam = def.Thickness
+    Dim cm As Double = thicknessParam.Value
+    Return cm / 2.54
+End Function
