@@ -1,0 +1,560 @@
+﻿Option Explicit On 'variables must be declared
+AddReference "Autodesk.Connectivity.WebServices"
+AddReference "Autodesk.DataManagement.Client.Framework"
+AddReference "Autodesk.DataManagement.Client.Framework.Vault"
+AddReference "Connectivity.InventorAddin.EdmAddin"
+Imports VDF = Autodesk.DataManagement.Client.Framework
+Imports Autodesk.DataManagement.Client.Framework.Vault.Connections
+Imports edm = Connectivity.InventorAddin.EdmAddin
+Imports ACW = Autodesk.Connectivity.WebServices
+Imports Autodesk.DataManagement.Client.Framework.Vault.Currency.Properties
+Imports System.Windows.Forms
+Imports Inventor
+Imports System.IO
+Imports System.Linq
+'PURPOSE
+	'Allows parts in an assembly to be saved in a custom order
+		'the left box contains all parts to remain unchanged (assemblies with a different IBM, standard parts, etc.)
+		'the right box contains parts to be reordered
+		'use the up and down buttons to reorder parts to your liking
+'NOTES
+	'
+'TODO
+	'rename assemblies like 1148637-01A
+	'make code work for assemblies with supressed components
+Class NewIBM
+    
+    Dim sequence As Integer 'tracks the ordering of parts (-001 etc.)
+    Dim authorName As String 'holds author name from iProperties
+    Dim savedItems() As String 'array of saved item names. This prevents later parts from being saved with duplicate names
+    Dim savedItemsCount As Integer 'tracks next available cell in savedItems array
+    Dim oAsmDoc As AssemblyDocument 'oAsmDoc stores active assembly document
+    Dim partData As New List(Of PartInfo) 'list of all part data (name, IBM, sequence) newUI
+    Dim oName As String 'saves the name (IBM) to be used for every part
+    Dim oPath As String 'Extracts the file path of the current document without a file name or extension 
+
+    Sub Main()	
+        oAsmDoc = ThisApplication.ActiveDocument
+        oName = ThisDoc.FileName(False)
+        oPath = ThisDoc.Path
+	
+        'Check file is assembly
+        If oAsmDoc Is Nothing Then
+            MsgBox("No assembly document is active.", vbExclamation, "iLogic")
+            Exit Sub
+        End If
+		
+        'Check Vault connection
+        Dim filePath As String = oAsmDoc.FullFileName
+        'Check the Windows File Attributes for the Read-Only flag
+        Dim fileInfo As New FileInfo(filePath)
+        If fileInfo.IsReadOnly Then
+            MessageBox.Show("This file is Read-Only (Checked In to Vault)." & vbCrLf & _
+            "Please check it out before running this script.", "Vault Protection")
+            Exit Sub
+        End If
+	
+        sequence = 1
+        authorName = iProperties.Value("Summary", "Author")
+        savedItemsCount = 0
+        Dim itemCount As Integer = 0
+		
+        Call CountItems(oAsmDoc.ComponentDefinition.Occurrences, itemCount, partData)
+        ReDim savedItems(0 To itemCount)
+		
+        ' Show UI form and get user-defined order (now returns List(Of PartInfo))
+        Dim orderedParts As List(Of PartInfo) = ShowPartOrderForm(partData)
+	    
+        If orderedParts Is Nothing OrElse orderedParts.Count = 0 Then Exit Sub
+		
+        Call DepthFirstSave(oAsmDoc.ComponentDefinition.Occurrences, orderedParts)
+	
+        MessageBox.Show("Part names and iProperties updated.", "Child File Save")
+    End Sub
+
+    Sub CountItems(Occurrences As ComponentOccurrences, ByRef itemCount As Integer, parts As List(Of PartInfo), Optional seenNames As Dictionary(Of String, Boolean) = Nothing)
+        ' Initialize dictionary if this is the first call
+        If seenNames Is Nothing Then seenNames = New Dictionary(Of String, Boolean)(StringComparer.OrdinalIgnoreCase)
+		
+        Dim oOcc As ComponentOccurrence
+	
+        For Each oOcc In Occurrences
+            Try
+                Dim doc As Document = oOcc.Definition.Document
+                Dim baseName As String = IO.Path.GetFileNameWithoutExtension(doc.FullFileName)
+	
+                Dim ibm As String = ""
+                Dim seq As String = ""
+                Dim partName As String = baseName
+	
+                If HasSequenceNumber(partName) Then 
+                    ' Recursively process subassemblies.
+                    If oOcc.DefinitionDocumentType = kAssemblyDocumentObject Then
+                        Call CountItems(oOcc.SubOccurrences, itemCount, parts, seenNames)
+                    End If
+				
+                    ' Split by space first (e.g. "1154495-001 TOP") "123456 ASM"
+                    Dim spaceSplit() As String = baseName.Split(" "c)
+	            
+                    If spaceSplit.Length >= 2 Then
+                        Dim firstPart As String = spaceSplit(0)
+                        partName = String.Join(" ", spaceSplit.Skip(1)) ' keep multi-word names
+	
+                        ' Split first part by dash
+                        Dim dashSplit() As String = firstPart.Split("-"c)
+                        If dashSplit.Length >= 2 Then
+                            ibm = dashSplit(0)
+                            seq = dashSplit(1)
+                        End If
+                    End If
+					
+                    ' Add to parts list only if name not already seen
+                    If Not seenNames.ContainsKey(partName) Then
+                        parts.Add(New PartInfo(partName, doc.FullFileName, ibm, seq))
+                        seenNames(partName) = True
+                        itemCount += 1
+                    End If
+                End If
+	
+            Catch ex As Exception
+                ' Skip suppressed or unresolved occurrences
+            End Try
+        Next
+    End Sub
+
+    Sub DepthFirstSave(Occurrences As ComponentOccurrences, orderedParts As List(Of PartInfo))
+        Dim sortedOccurrences As New List(Of ComponentOccurrence)
+        Dim oOcc As ComponentOccurrence
+        For Each oOcc In Occurrences
+            sortedOccurrences.Add(oOcc)
+        Next
+
+        sortedOccurrences = sortedOccurrences _
+            .OrderBy(Function(o)
+                         Dim docName As String = ""
+                         Try
+                             If o.Definition IsNot Nothing AndAlso _
+                                o.Definition.Document IsNot Nothing Then
+                                 docName = IO.Path.GetFileNameWithoutExtension(o.Definition.Document.FullFileName)
+                             End If
+                         Catch
+                         End Try
+		
+                         Dim docFullPath As String = ""
+                         Try
+                             If o.Definition IsNot Nothing AndAlso o.Definition.Document IsNot Nothing Then
+                                 docFullPath = o.Definition.Document.FullFileName
+                             End If
+                         Catch
+                         End Try
+                         Dim idx As Integer = orderedParts.FindIndex(Function(p) String.Equals(p.Path, docFullPath, StringComparison.OrdinalIgnoreCase))
+                         Return If(idx >= 0, idx, Integer.MaxValue)
+                     End Function) _
+            .ToList()	
+	
+        For Each oOcc In sortedOccurrences
+            Try
+                If oOcc.Suppressed Then Continue For
+            Catch
+            End Try
+		    
+            Dim doc As Document = Nothing
+            Try
+                doc = oOcc.Definition.Document
+            Catch
+                Continue For
+            End Try
+			
+            If doc Is Nothing Then Continue For
+		    
+            Dim docFullPath As String = ""
+            Try
+                docFullPath = doc.FullFileName
+            Catch
+            End Try
+            If String.IsNullOrEmpty(docFullPath) Then Continue For
+    
+            ' Skip any part not in the right list (orderedParts)
+            Dim matchingPart As PartInfo = orderedParts.FirstOrDefault(Function(p) String.Equals(p.Path, docFullPath, StringComparison.OrdinalIgnoreCase))
+            If matchingPart Is Nothing Then
+                Continue For
+            End If
+
+            Call ProcessOccurrence(oOcc, matchingPart.PartName)
+	
+            If oOcc.DefinitionDocumentType = kAssemblyDocumentObject Then
+                Dim subAsmDoc As Document = oOcc.Definition.Document
+                Dim subAsmName As String = subAsmDoc.DisplayName
+	
+                ' Only recurse into subassembly if it has a sequence number
+                If HasSequenceNumber(subAsmName) Then
+                    Call DepthFirstSave(oOcc.SubOccurrences, orderedParts)
+                Else
+                    Debug.Print("Skipping subassembly without sequence number: " & subAsmName)
+                End If
+            End If
+        Next
+    End Sub
+	
+    Function HasSequenceNumber(fileName As String) As Boolean
+        Dim baseName As String = IO.Path.GetFileNameWithoutExtension(fileName)
+        Dim parts() As String = baseName.Split(" "c)
+        If parts.Length = 0 Then Return False
+	
+        Dim ibmPart As String = parts(0) 
+        Dim splitDash() As String = ibmPart.Split("-"c)
+	
+        If splitDash.Length = 2 AndAlso IsNumeric(splitDash(0)) AndAlso splitDash(0).Length > 5 AndAlso IsNumeric(splitDash(1)) Then
+            Return True
+        End If
+	
+        Return False
+    End Function
+	
+    Function GetOccurrenceFullPath(oOcc As ComponentOccurrence) As String
+        Dim Path As String = oOcc.Name
+        Dim parentOcc As ComponentOccurrence = oOcc.ParentOccurrence
+	
+        While Not parentOcc Is Nothing
+            Path = parentOcc.Name & "\" & Path
+            parentOcc = parentOcc.ParentOccurrence
+        End While
+	
+        Return Path
+    End Function
+
+    Sub ProcessOccurrence(oOcc As ComponentOccurrence, Optional newTitleNoExt As String = Nothing)
+	    Dim doc As Document = oOcc.Definition.Document
+	    Dim sPath As String = oOcc.ReferencedFileDescriptor.FullFileName
+	    Dim sSplit() As String = sPath.Split("\")
+	    Dim sName As String = sSplit(UBound(sSplit))
+	    Dim ibmLength As Integer
+	    Dim newName As String 
+	    Dim newPath As String 
+	    Dim titleWithExt As String = "" 
+	    Dim titleNoExt As String = "" 
+	    Dim isDup As Boolean = False 
+	
+	    Dim originalExt As String = IO.Path.GetExtension(sName) 
+	
+	    If Not String.IsNullOrEmpty(newTitleNoExt) Then
+	        titleNoExt = newTitleNoExt
+	        titleWithExt = newTitleNoExt & originalExt
+	    Else
+	        For ibmLength = 1 To Len(sName) - 4 
+	            If IsNumeric(Left(sName, 5)) And Mid(sName, ibmLength + 1, 1) = "-" And IsNumeric(Left(sName, ibmLength)) Then
+	                Dim endSeq As Integer
+	                For endSeq = ibmLength + 2 To Len(sName)
+	                    If Mid(sName, endSeq, 1) = " " Then 
+	                        titleWithExt = Right(sName, Len(sName) - endSeq) 
+	                        titleNoExt = IO.Path.GetFileNameWithoutExtension(titleWithExt)
+	                        Exit For
+	                    End If
+	                Next
+	                Exit For
+	            End If
+	        Next
+	    End If
+	
+	    If String.IsNullOrEmpty(titleNoExt) Then
+	        Exit Sub
+	    End If
+	
+	    newName = oName & "-" & sequence.ToString("000") & " " & titleWithExt 
+	    newPath = oPath & "\" & newName
+	
+	    ' CHECK AGAINST THE ORIGINAL FILE PATH, NOT JUST THE TITLE
+	    Dim originalFullPath As String = ""
+	    Try
+	        originalFullPath = doc.FullFileName
+	    Catch
+	    End Try
+	
+	    ' Track the original file path, not the title
+	    For check = LBound(savedItems) To UBound(savedItems)
+	        If Trim(savedItems(check)) = Trim(originalFullPath) Then
+	            isDup = True
+	            Exit For
+	        End If
+	    Next
+	
+	    If isDup = False Then 
+	        Dim canProceed As Boolean = True
+	
+	        ' If a part with this name already exists in the assembly folder, overwrite it
+	        ' instead of skipping the save (which previously caused an error/left the old file in place).
+	        Dim needsSaveAs As Boolean = True
+	
+	        If Dir(newPath) <> "" Then
+	            Dim isSameFile As Boolean = False
+	            Try
+	                isSameFile = String.Equals(doc.FullFileName, newPath, StringComparison.OrdinalIgnoreCase)
+	            Catch
+	            End Try
+	
+	            If isSameFile Then
+	                Try
+	                    doc.Save()
+	                Catch ex As Exception
+	                    MessageBox.Show("Could not save '" & newName & "':" & vbCrLf & ex.Message, "Save Error")
+	                    canProceed = False
+	                End Try
+	                needsSaveAs = False
+	            Else
+	                Dim existingFile As New FileInfo(newPath)
+	
+	                If existingFile.IsReadOnly Then
+	                    MessageBox.Show("Cannot overwrite '" & newName & "' because it already exists and is Read-Only (Checked In to Vault)." & vbCrLf & _
+	                        "Please check it out in Vault and re-run the rule.", "Vault Protection - Overwrite Skipped")
+	                    canProceed = False
+	                Else
+	                    Try
+	                        System.IO.File.Delete(newPath)
+	                    Catch ex As Exception
+	                        MessageBox.Show("Could not overwrite existing file '" & newName & "':" & vbCrLf & ex.Message, "Overwrite Error")
+	                        canProceed = False
+	                    End Try
+	                End If
+	            End If
+	        End If
+	
+	        If canProceed Then
+	            If needsSaveAs Then
+	                doc.SaveAs(newPath, True) 
+	                oOcc.Replace(newPath, True) 
+	            End If
+	
+	            ' STORE THE ORIGINAL FILE PATH, NOT THE TITLE
+	            savedItems(savedItemsCount) = originalFullPath
+	            savedItemsCount = savedItemsCount + 1 
+	            Call UpdateiProperties(newName, oName, sequence, titleNoExt)
+	            
+	            ' =========================================================================
+	            ' TUB AUTOMATION INJECTION
+	            ' =========================================================================
+	            Dim nameUpper As String = newName.ToUpper()
+	            If nameUpper.Contains("TUB") AndAlso nameUpper.Contains("X") AndAlso Not nameUpper.Contains("RINSE") Then
+	                If TypeOf doc.ComponentDefinition Is SheetMetalComponentDefinition Then
+	                    Try
+	                        Dim tubDoc As PartDocument = ThisApplication.Documents.Open(newPath, True)
+	                        tubDoc.Activate()
+	                        
+	                        Dim rulePath As String = "C:\Users\hmclinn\OneDrive - winholt.com\Documents\Hunter's Folder\Coding Projects\Autodesk Tools\Reference\Create Tub Flat.iLogicVb"
+	                        iLogicVb.RunExternalRule(rulePath)
+	                        
+	                        tubDoc.Close(True)
+	                        
+	                        oAsmDoc.Activate()
+	                    Catch ex As Exception
+	                        MessageBox.Show("Failed to run 'Create Tub Flat' logic on: " & newName & vbCrLf & ex.Message, "Tub Flat Generation Error")
+	                    End Try
+	                End If
+	            End If
+	            ' =========================================================================
+	
+	            sequence = sequence + 1
+	        End If
+	    End If
+	End Sub
+
+    Sub UpdateiProperties(newName As String, oName As String, sequence As Integer, titleNoExt As String)
+        iProperties.Value(newName, "Summary", "Author") = authorName 
+        iProperties.Value(newName, "Project", "Part Number") = oName & "-" & sequence.ToString("000") 
+        iProperties.Value(newName, "Project", "Designer") = authorName 
+        iProperties.Value(newName, "Project", "Creation Date") = Now.ToShortDateString 
+        iProperties.Value(newName, "Project", "Description") = titleNoExt 
+    End Sub
+	
+    Function FileCheckedOutByMe(conn As VDF.Vault.Currency.Connections.Connection, fileName As String) As Boolean
+        If conn Is Nothing Then
+            Return True
+        End If
+	
+        Try
+            Dim oVaultFileName As String
+            Dim oWF As String = conn.WorkingFoldersManager.GetWorkingFolder("$/").FullPath
+	
+            If fileName.ToLower().Contains(oWF.ToLower()) Then
+                oVaultFileName = fileName.Replace(oWF, "$/").Replace("\", "/")
+            Else
+                Return True
+            End If
+	
+            Dim oWSmgr As Autodesk.Connectivity.WebServicesTools.WebServiceManager = conn.WebServiceManager
+            Dim oFile As ACW.File = oWSmgr.DocumentService.FindLatestFilesByPaths(New String() {oVaultFileName}).FirstOrDefault()
+	
+            If oFile Is Nothing OrElse oFile.Id = -1 Then
+                Return True
+            End If
+	
+            Dim oFileIteration As New VDF.Vault.Currency.Entities.FileIteration(conn, oFile)
+            Dim oProps As PropertyDefinitionDictionary = conn.PropertyManager.GetPropertyDefinitions(VDF.Vault.Currency.Entities.EntityClassIds.Files, Nothing, PropertyDefinitionFilter.IncludeAll)
+            Dim oVaultStatus As PropertyDefinition = oProps(PropertyDefinitionIds.Client.VaultStatus)
+            Dim status As EntityStatusImageInfo = TryCast(conn.PropertyManager.GetPropertyValue(oFileIteration, oVaultStatus, Nothing), EntityStatusImageInfo)
+            Dim oCheckoutState As EntityStatus.CheckoutStateEnum = status.Status.CheckoutState
+	
+            Return (oCheckoutState = EntityStatus.CheckoutStateEnum.CheckedOutByCurrentUser)
+	    Catch ex As Exception
+            Return True
+        End Try
+    End Function
+	
+    Public Class PartInfo
+        Public Property PartName As String
+        Public Property Path As String
+        Public Property IBM As String
+        Public Property sequence As String
+        Public Sub New(partName As String, Path As String, ibm As String, seq As String)
+            Me.PartName = partName
+            Me.Path = Path
+            Me.IBM = ibm
+            Me.sequence = seq
+        End Sub
+
+        Public Overrides Function ToString() As String
+            Return IBM & "-" & sequence & " " & PartName
+        End Function
+    End Class
+
+    Private Function ShowPartOrderForm(parts As List(Of PartInfo)) As List(Of PartInfo)
+        Dim result As New List(Of PartInfo)
+	
+        Dim form As New System.Windows.Forms.Form()
+        form.Text = "Part Naming Order"
+        form.Width = 820
+        form.Height = 460
+        form.StartPosition = FormStartPosition.CenterScreen
+	
+        Dim lstLeft As New System.Windows.Forms.ListBox()
+        lstLeft.Width = 340 : lstLeft.Height = 300
+        lstLeft.Top = 20 : lstLeft.Left = 20
+        lstLeft.SelectionMode = SelectionMode.MultiExtended
+        lstLeft.HorizontalScrollbar = True
+        form.Controls.Add(lstLeft)
+	
+        Dim lstRight As New System.Windows.Forms.ListBox()
+        lstRight.Width = 340 : lstRight.Height = 300
+        lstRight.Top = 20 : lstRight.Left = 460
+        lstRight.SelectionMode = SelectionMode.One
+        lstRight.HorizontalScrollbar = True
+        form.Controls.Add(lstRight)
+	
+        For Each p In parts.OrderBy(Function(x)
+            Dim seqNum As Integer
+            If Not Integer.TryParse(x.sequence, seqNum) Then seqNum = 999
+            Return seqNum
+        End Function)
+            lstRight.Items.Add(p)
+        Next
+
+        Dim lblRename As New System.Windows.Forms.Label()
+        lblRename.Text = "Rename selected (title only):"
+        lblRename.Top = 335 : lblRename.Left = 460 : lblRename.Width = 200
+        form.Controls.Add(lblRename)
+
+        Dim txtRename As New System.Windows.Forms.TextBox()
+        txtRename.Top = 360 : txtRename.Left = 460 : txtRename.Width = 260
+        form.Controls.Add(txtRename)
+
+        Dim btnApplyRename As New System.Windows.Forms.Button()
+        btnApplyRename.Text = "Apply Rename" : btnApplyRename.Top = 360 : btnApplyRename.Left = 730 : btnApplyRename.Width = 70
+        AddHandler btnApplyRename.Click, Sub(sender, e)
+            If lstRight.SelectedItem IsNot Nothing Then
+                Dim pInfo As PartInfo = CType(lstRight.SelectedItem, PartInfo)
+                If Not String.IsNullOrWhiteSpace(txtRename.Text) Then
+                    pInfo.PartName = txtRename.Text.Trim()
+                    Dim idx As Integer = lstRight.SelectedIndex
+                    Dim itemObj As Object = lstRight.Items(idx)
+                    lstRight.Items.RemoveAt(idx)
+                    lstRight.Items.Insert(idx, itemObj)
+                    lstRight.SelectedIndex = idx
+                End If
+            End If
+        End Sub
+        form.Controls.Add(btnApplyRename)
+
+        AddHandler lstRight.SelectedIndexChanged, Sub(sender, e)
+            If lstRight.SelectedItem IsNot Nothing Then
+                Dim sel As PartInfo = CType(lstRight.SelectedItem, PartInfo)
+                txtRename.Text = sel.PartName
+            Else
+                txtRename.Text = ""
+            End If
+        End Sub
+
+        Dim btnAdd As New System.Windows.Forms.Button()
+        btnAdd.Text = "Add →" : btnAdd.Top = 60 : btnAdd.Left = 380 : btnAdd.Width = 70 
+        AddHandler btnAdd.Click, Sub(sender, e)
+            For Each item In lstLeft.SelectedItems.Cast(Of PartInfo).ToList()
+                If Not lstRight.Items.Contains(item) Then
+                    lstRight.Items.Add(item)
+                    lstLeft.Items.Remove(item)
+                End If
+            Next
+        End Sub
+        form.Controls.Add(btnAdd)
+	
+        Dim btnRemove As New System.Windows.Forms.Button()
+        btnRemove.Text = "← Remove" : btnRemove.Top = 100 : btnRemove.Left = 380 : btnRemove.Width = 70
+        AddHandler btnRemove.Click, Sub(sender, e)
+            For Each item In lstRight.SelectedItems.Cast(Of PartInfo).ToList()
+                If Not lstLeft.Items.Contains(item) Then
+                    lstLeft.Items.Add(item)
+                    lstRight.Items.Remove(item)
+                End If
+            Next
+        End Sub
+        form.Controls.Add(btnRemove)
+	
+        Dim btnUp As New System.Windows.Forms.Button()
+        btnUp.Text = "Move Up" : btnUp.Top = 180 : btnUp.Left = 380 : btnUp.Width = 70
+        AddHandler btnUp.Click, Sub(sender, e)
+            If lstRight.SelectedIndex > 0 Then
+                Dim idx = lstRight.SelectedIndex
+                Dim item = lstRight.Items(idx)
+                lstRight.Items.RemoveAt(idx)
+                lstRight.Items.Insert(idx - 1, item)
+                lstRight.SelectedIndex = idx - 1
+            End If
+        End Sub
+        form.Controls.Add(btnUp)
+	
+        Dim btnDown As New System.Windows.Forms.Button()
+        btnDown.Text = "Move Down" : btnDown.Top = 220 : btnDown.Left = 380 : btnDown.Width = 70
+        AddHandler btnDown.Click, Sub(sender, e)
+            If lstRight.SelectedIndex >= 0 And lstRight.SelectedIndex < lstRight.Items.Count - 1 Then
+                Dim idx = lstRight.SelectedIndex
+                Dim item = lstRight.Items(idx)
+                lstRight.Items.RemoveAt(idx)
+                lstRight.Items.Insert(idx + 1, item)
+                lstRight.SelectedIndex = idx + 1
+            End If
+        End Sub
+        form.Controls.Add(btnDown)
+	
+        Dim btnOK As New System.Windows.Forms.Button()
+        btnOK.Text = "OK" : btnOK.Top = 400 : btnOK.Left = 340
+        AddHandler btnOK.Click, Sub(sender, e)
+            For Each item In lstRight.Items
+                result.Add(CType(item, PartInfo))
+            Next
+            form.DialogResult = DialogResult.OK
+            form.Close()
+        End Sub
+        form.Controls.Add(btnOK)
+	
+        Dim btnCancel As New System.Windows.Forms.Button()
+        btnCancel.Text = "Cancel" : btnCancel.Top = 400 : btnCancel.Left = 420
+        AddHandler btnCancel.Click, Sub(sender, e)
+            form.DialogResult = DialogResult.Cancel
+            form.Close()
+        End Sub
+        form.Controls.Add(btnCancel)
+	
+        If form.ShowDialog() = DialogResult.OK Then
+            Return result
+        Else
+            Return Nothing
+        End If
+    End Function
+End Class
